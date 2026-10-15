@@ -16,19 +16,50 @@ function canvasToBlob(canvas: HTMLCanvasElement) {
   })
 }
 
+function roundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  const safeRadius = Math.min(radius, width / 2, height / 2)
+
+  context.beginPath()
+  context.moveTo(x + safeRadius, y)
+  context.lineTo(x + width - safeRadius, y)
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius)
+  context.lineTo(x + width, y + height - safeRadius)
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height)
+  context.lineTo(x + safeRadius, y + height)
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius)
+  context.lineTo(x, y + safeRadius)
+  context.quadraticCurveTo(x, y, x + safeRadius, y)
+  context.closePath()
+}
+
 export async function exportPatternAsPng(pattern: PixelPattern, showCodes: boolean) {
   const cellSize = Math.max(20, Math.min(36, Math.floor(2400 / pattern.size)))
-  const canvasSize = pattern.size * cellSize + 1
+  const gridPixels = pattern.size * cellSize + 1
+  const margin = 48
+  const columnGap = 16
+  const rowGap = 14
+  const cardHeight = 70
+  const columns = gridPixels >= 1600 ? 5 : gridPixels >= 1100 ? 4 : 3
+  const rows = Math.max(1, Math.ceil(pattern.stats.length / columns))
+  const statisticsHeaderHeight = 116
+  const statisticsHeight = statisticsHeaderHeight + rows * cardHeight + Math.max(0, rows - 1) * rowGap + 48
   const canvas = document.createElement('canvas')
-  canvas.width = canvasSize
-  canvas.height = canvasSize
+  canvas.width = gridPixels
+  canvas.height = gridPixels + statisticsHeight
 
   const context = canvas.getContext('2d')
   if (!context) throw new Error('CANVAS_UNAVAILABLE')
 
   context.imageSmoothingEnabled = false
   context.fillStyle = '#B8ABA4'
-  context.fillRect(0, 0, canvasSize, canvasSize)
+  context.fillRect(0, 0, gridPixels, gridPixels)
   context.textAlign = 'center'
   context.textBaseline = 'middle'
   context.font = `800 ${Math.max(8, Math.floor(cellSize * 0.3))}px Inter, "Noto Sans SC", sans-serif`
@@ -45,6 +76,71 @@ export async function exportPatternAsPng(pattern: PixelPattern, showCodes: boole
       context.fillStyle = textColor(cell.hex)
       context.fillText(cell.code.slice(-3), x + (cellSize - 1) / 2, y + (cellSize - 1) / 2)
     }
+  })
+
+  const statisticsTop = gridPixels
+  context.fillStyle = '#FFF9F2'
+  context.fillRect(0, statisticsTop, gridPixels, statisticsHeight)
+
+  context.strokeStyle = '#E7DCD2'
+  context.lineWidth = 2
+  context.beginPath()
+  context.moveTo(0, statisticsTop + 1)
+  context.lineTo(gridPixels, statisticsTop + 1)
+  context.stroke()
+
+  const totalBeads = pattern.stats.reduce((total, color) => total + color.count, 0)
+
+  context.textBaseline = 'alphabetic'
+  context.textAlign = 'left'
+  context.fillStyle = '#2B2D42'
+  context.font = '900 32px Inter, "Noto Sans SC", sans-serif'
+  context.fillText('色号与用量统计', margin, statisticsTop + 54)
+
+  context.fillStyle = '#6C757D'
+  context.font = '600 20px Inter, "Noto Sans SC", sans-serif'
+  context.fillText(
+    `MARD 221 模拟色卡 · 共 ${totalBeads} 颗 · ${pattern.stats.length} 种颜色`,
+    margin,
+    statisticsTop + 86,
+  )
+
+  const cardWidth = (gridPixels - margin * 2 - columnGap * (columns - 1)) / columns
+  const cardsTop = statisticsTop + statisticsHeaderHeight
+
+  pattern.stats.forEach((color, index) => {
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    const x = margin + column * (cardWidth + columnGap)
+    const y = cardsTop + row * (cardHeight + rowGap)
+
+    roundedRect(context, x, y, cardWidth, cardHeight, 14)
+    context.fillStyle = '#FFFDFC'
+    context.fill()
+    context.strokeStyle = '#E8DED6'
+    context.lineWidth = 1.5
+    context.stroke()
+
+    const swatchSize = 38
+    const swatchX = x + 16
+    const swatchY = y + (cardHeight - swatchSize) / 2
+
+    roundedRect(context, swatchX, swatchY, swatchSize, swatchSize, 8)
+    context.fillStyle = color.hex
+    context.fill()
+    context.strokeStyle = 'rgba(43, 45, 66, 0.14)'
+    context.lineWidth = 1
+    context.stroke()
+
+    context.textAlign = 'left'
+    context.textBaseline = 'alphabetic'
+    context.fillStyle = '#2B2D42'
+    context.font = '800 18px Inter, "Noto Sans SC", sans-serif'
+    context.fillText(color.code, swatchX + swatchSize + 13, y + 30)
+
+    context.fillStyle = '#6C757D'
+    context.font = '700 16px Inter, "Noto Sans SC", sans-serif'
+    context.fillText(`${color.count} 颗`, swatchX + swatchSize + 13, y + 53)
   })
 
   const blob = await canvasToBlob(canvas)
