@@ -1,5 +1,9 @@
 import { mard221 } from '../data/mard221.js'
-import { deltaE2000, hexToLab, labEuclidean } from './color'
+import {
+  deltaE2000,
+  hexToLab,
+  labEuclidean,
+} from './color'
 import type { MardColor } from '../data/mard221.js'
 import type { LabColor } from './color'
 
@@ -29,9 +33,20 @@ export type PixelPattern = {
 }
 
 export type PixelateOptions = {
+  /** 是否启用 Floyd–Steinberg 抖动。 */
   dithering?: boolean
+
+  /** 是否把与画布边缘连通的高亮、低饱和区域标记为空白。 */
   removeBackground?: boolean
+
+  /** 是否使用统一深色为主体勾勒最外圈。 */
   outline?: boolean
+
+  /** 相邻颜色在 CIEDE2000 色差低于此值时合并。 */
+  mergeThreshold?: number
+
+  /** 图纸允许使用的最大颜色总数，包含统一描边色。 */
+  maxColors?: number
 }
 
 type RgbColor = {
@@ -44,7 +59,24 @@ type PreparedMardColor = MardColor & {
   lab: LabColor
 }
 
+type PaletteMatch = Omit<
+  QuantizedPixel,
+  'averageHex' | 'isEmpty' | 'isOutline'
+>
+
 const SAMPLE_LIMIT = 1024
+const DEFAULT_MERGE_THRESHOLD = 5
+const DEFAULT_MAX_COLORS = 24
+
+const OUTLINE_COLOR: QuantizedPixel = {
+  averageHex: '#2E2B2F',
+  hex: '#2E2B2F',
+  code: 'MARD-000',
+  name: '统一轮廓深灰',
+  deltaE: 0,
+  isEmpty: false,
+  isOutline: true,
+}
 
 const preparedPalette: PreparedMardColor[] = mard221.map(
   (color) => ({
@@ -53,16 +85,15 @@ const preparedPalette: PreparedMardColor[] = mard221.map(
   }),
 )
 
-const matchCache = new Map<
-  string,
-  Omit<QuantizedPixel, 'averageHex'>
->()
+const matchCache = new Map<string, PaletteMatch>()
+const labCache = new Map<string, LabColor>()
 
 function loadImage(source: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image()
 
     image.onload = () => resolve(image)
+
     image.onerror = () => {
       reject(new Error('IMAGE_DECODE_FAILED'))
     }
@@ -97,9 +128,138 @@ function hexToRgb(hex: string): RgbColor {
   }
 }
 
+function getLab(hex: string) {
+  const cached = labCache.get(hex)
+
+  if (cached) {
+    return cached
+  }
+
+  const lab = hexToLab(hex)
+  labCache.set(hex, lab)
+
+  return lab
+}
+
+function colorDifference(
+  leftHex: string,
+  rightHex: string,
+) {
+  const left = getLab(leftHex)
+  const right = getLab(rightHex)
+  const calculated = deltaE2000(left, right)
+
+  return Number.isFinite(calculated)
+    ? calculated
+    : labEuclidean(left, right)
+}
+
 /**
- * 判断一个网格平均色是否属于高亮、低饱和的白色背景。
+ * 提取网格主导色，而不是混合网格内的所有像素。
+ *
+ * 优先使用出现次数最多的精确 RGB。
+ * 当照片压缩导致所有颜色都只出现一次时，
+ * 使用 5-bit RGB 色桶找出最密集的颜色簇，
+ * 并仅对该颜色簇求代表色。
  */
+function dominantCellColor(
+  pixels: ImageData,
+  sampleSize: number,
+  startX: number,
+  endX: number,
+  startY: number,
+  endY: number,
+): RgbColor {
+  const exactCounts = new Map<number, number>()
+
+  const buckets = new Map<
+    number,
+    {
+      count: number
+      red: number
+      green: number
+      blue: number
+    }
+  >()
+
+  let bestExactKey = 0
+  let bestExactCount = 0
+
+  for (let y = startY; y < endY; y += 1) {
+    for (let x = startX; x < endX; x += 1) {
+      const offset = (y * sampleSize + x) * 4
+
+      const red = pixels.data[offset]
+      const green = pixels.data[offset + 1]
+      const blue = pixels.data[offset + 2]
+
+      const exactKey =
+        (red << 16) |
+        (green << 8) |
+        blue
+
+      const exactCount =
+        (exactCounts.get(exactKey) ?? 0) + 1
+
+      exactCounts.set(exactKey, exactCount)
+
+      if (exactCount > bestExactCount) {
+        bestExactCount = exactCount
+        bestExactKey = exactKey
+      }
+
+      const bucketKey =
+        ((red >> 3) << 10) |
+        ((green >> 3) << 5) |
+        (blue >> 3)
+
+      const bucket = buckets.get(bucketKey)
+
+      if (bucket) {
+        bucket.count += 1
+        bucket.red += red
+        bucket.green += green
+        bucket.blue += blue
+      } else {
+        buckets.set(bucketKey, {
+          count: 1,
+          red,
+          green,
+          blue,
+        })
+      }
+    }
+  }
+
+  if (bestExactCount > 1) {
+    return {
+      red: (bestExactKey >> 16) & 255,
+      green: (bestExactKey >> 8) & 255,
+      blue: bestExactKey & 255,
+    }
+  }
+
+  let dominantBucket = {
+    count: 1,
+    red: 255,
+    green: 249,
+    blue: 242,
+  }
+
+  for (const bucket of buckets.values()) {
+    if (bucket.count > dominantBucket.count) {
+      dominantBucket = bucket
+    }
+  }
+
+  return {
+    red: dominantBucket.red / dominantBucket.count,
+    green:
+      dominantBucket.green / dominantBucket.count,
+    blue: dominantBucket.blue / dominantBucket.count,
+  }
+}
+
 function isWhiteBackgroundCandidate(
   red: number,
   green: number,
@@ -122,10 +282,7 @@ function isWhiteBackgroundCandidate(
 }
 
 /**
- * 从画布四周开始做四方向连通搜索。
- *
- * 只有与边缘连通的白色、高亮、低饱和区域会被识别为背景，
- * 避免把人物内部独立存在的白色区域全部误删。
+ * 仅移除从画布边缘连通进来的亮色、低饱和背景。
  */
 function createBackgroundMask(
   colors: Float64Array,
@@ -136,21 +293,19 @@ function createBackgroundMask(
   const queue: number[] = []
 
   const enqueue = (index: number) => {
-    if (visited[index]) return
+    if (visited[index]) {
+      return
+    }
 
     visited[index] = 1
 
     const offset = index * 3
 
-    const red = colors[offset]
-    const green = colors[offset + 1]
-    const blue = colors[offset + 2]
-
     if (
       isWhiteBackgroundCandidate(
-        red,
-        green,
-        blue,
+        colors[offset],
+        colors[offset + 1],
+        colors[offset + 2],
       )
     ) {
       mask[index] = 1
@@ -163,16 +318,9 @@ function createBackgroundMask(
     position < size;
     position += 1
   ) {
-    // 顶边
     enqueue(position)
-
-    // 底边
     enqueue((size - 1) * size + position)
-
-    // 左边
     enqueue(position * size)
-
-    // 右边
     enqueue(position * size + size - 1)
   }
 
@@ -206,9 +354,8 @@ function createBackgroundMask(
 }
 
 /**
- * 查找主体与空白背景接触的最外圈。
- *
- * 使用八邻域检测，使斜线和圆弧轮廓也能够连续。
+ * 使用八邻域把主体与背景接触的最外圈
+ * 标记为统一描边。
  */
 function createOutlineMask(
   backgroundMask: Uint8Array,
@@ -220,16 +367,13 @@ function createOutlineMask(
     for (let x = 0; x < size; x += 1) {
       const index = y * size + x
 
-      // 背景格本身不参与描边。
       if (backgroundMask[index]) {
         continue
       }
 
-      let touchesBackground = false
-
       for (
         let offsetY = -1;
-        offsetY <= 1 && !touchesBackground;
+        offsetY <= 1 && !mask[index];
         offsetY += 1
       ) {
         for (
@@ -237,10 +381,7 @@ function createOutlineMask(
           offsetX <= 1;
           offsetX += 1
         ) {
-          if (
-            offsetX === 0 &&
-            offsetY === 0
-          ) {
+          if (offsetX === 0 && offsetY === 0) {
             continue
           }
 
@@ -256,18 +397,15 @@ function createOutlineMask(
             continue
           }
 
-          const neighborIndex =
-            neighborY * size + neighborX
-
-          if (backgroundMask[neighborIndex]) {
-            touchesBackground = true
+          if (
+            backgroundMask[
+              neighborY * size + neighborX
+            ]
+          ) {
+            mask[index] = 1
             break
           }
         }
-      }
-
-      if (touchesBackground) {
-        mask[index] = 1
       }
     }
   }
@@ -276,43 +414,32 @@ function createOutlineMask(
 }
 
 /**
- * 使用 LAB 与 CIEDE2000 匹配最接近的模拟 MARD 颜色。
- *
- * CIEDE2000 始终优先；
- * 仅当计算结果不是有效数字时，才回退到 LAB 欧氏距离。
+ * RGB 转 LAB 后优先使用 CIEDE2000 匹配色卡。
  */
 function matchMardColor(
-  averageHex: string,
-): QuantizedPixel {
-  const cached = matchCache.get(averageHex)
+  sourceHex: string,
+): PaletteMatch {
+  const cached = matchCache.get(sourceHex)
 
   if (cached) {
-    return {
-      averageHex,
-      ...cached,
-    }
+    return cached
   }
 
-  const sourceLab = hexToLab(averageHex)
+  const sourceLab = getLab(sourceHex)
 
   let best = preparedPalette[0]
   let bestDelta = Number.POSITIVE_INFINITY
   let bestEuclidean = Number.POSITIVE_INFINITY
 
   for (const candidate of preparedPalette) {
-    const calculatedDelta = deltaE2000(
+    const calculated = deltaE2000(
       sourceLab,
       candidate.lab,
     )
 
-    const delta = Number.isFinite(
-      calculatedDelta,
-    )
-      ? calculatedDelta
-      : labEuclidean(
-          sourceLab,
-          candidate.lab,
-        )
+    const delta = Number.isFinite(calculated)
+      ? calculated
+      : labEuclidean(sourceLab, candidate.lab)
 
     const euclidean = labEuclidean(
       sourceLab,
@@ -321,10 +448,8 @@ function matchMardColor(
 
     if (
       delta < bestDelta ||
-      (
-        Math.abs(delta - bestDelta) < 1e-9 &&
-        euclidean < bestEuclidean
-      )
+      (Math.abs(delta - bestDelta) < 1e-9 &&
+        euclidean < bestEuclidean)
     ) {
       best = candidate
       bestDelta = delta
@@ -339,22 +464,362 @@ function matchMardColor(
     deltaE: bestDelta,
   }
 
-  matchCache.set(averageHex, match)
+  matchCache.set(sourceHex, match)
 
-  return {
-    averageHex,
-    ...match,
+  return match
+}
+
+function normalColorCounts(
+  cells: QuantizedPixel[],
+) {
+  const counts = new Map<string, number>()
+
+  for (const cell of cells) {
+    if (cell.isEmpty || cell.isOutline) {
+      continue
+    }
+
+    counts.set(
+      cell.code,
+      (counts.get(cell.code) ?? 0) + 1,
+    )
   }
+
+  return counts
+}
+
+/**
+ * 合并相邻且 LAB 色差低于阈值的颜色。
+ *
+ * 使用并查集连接相邻颜色组，
+ * 并始终保留全图使用次数更多的颜色。
+ */
+function mergeSimilarNeighborColors(
+  cells: QuantizedPixel[],
+  size: number,
+  threshold: number,
+) {
+  if (threshold <= 0) {
+    return cells
+  }
+
+  const counts = normalColorCounts(cells)
+
+  const representatives = new Map<
+    string,
+    QuantizedPixel
+  >()
+
+  for (const cell of cells) {
+    if (
+      !cell.isEmpty &&
+      !cell.isOutline &&
+      !representatives.has(cell.code)
+    ) {
+      representatives.set(cell.code, cell)
+    }
+  }
+
+  const parent = new Map<string, string>()
+  const weights = new Map<string, number>()
+
+  for (const [code, count] of counts) {
+    parent.set(code, code)
+    weights.set(code, count)
+  }
+
+  const find = (code: string): string => {
+    const current = parent.get(code) ?? code
+
+    if (current === code) {
+      return code
+    }
+
+    const root = find(current)
+    parent.set(code, root)
+
+    return root
+  }
+
+  const union = (
+    leftCode: string,
+    rightCode: string,
+  ) => {
+    const leftRoot = find(leftCode)
+    const rightRoot = find(rightCode)
+
+    if (leftRoot === rightRoot) {
+      return
+    }
+
+    const leftColor =
+      representatives.get(leftRoot)
+
+    const rightColor =
+      representatives.get(rightRoot)
+
+    if (
+      !leftColor ||
+      !rightColor ||
+      colorDifference(
+        leftColor.hex,
+        rightColor.hex,
+      ) >= threshold
+    ) {
+      return
+    }
+
+    const leftWeight =
+      weights.get(leftRoot) ?? 0
+
+    const rightWeight =
+      weights.get(rightRoot) ?? 0
+
+    const winner =
+      leftWeight > rightWeight ||
+      (leftWeight === rightWeight &&
+        leftRoot < rightRoot)
+        ? leftRoot
+        : rightRoot
+
+    const loser =
+      winner === leftRoot
+        ? rightRoot
+        : leftRoot
+
+    parent.set(loser, winner)
+
+    weights.set(
+      winner,
+      leftWeight + rightWeight,
+    )
+  }
+
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const index = y * size + x
+      const cell = cells[index]
+
+      if (cell.isEmpty || cell.isOutline) {
+        continue
+      }
+
+      if (x + 1 < size) {
+        const right = cells[index + 1]
+
+        if (
+          !right.isEmpty &&
+          !right.isOutline
+        ) {
+          union(cell.code, right.code)
+        }
+      }
+
+      if (y + 1 < size) {
+        const below = cells[index + size]
+
+        if (
+          !below.isEmpty &&
+          !below.isOutline
+        ) {
+          union(cell.code, below.code)
+        }
+      }
+    }
+  }
+
+  return cells.map((cell) => {
+    if (cell.isEmpty || cell.isOutline) {
+      return cell
+    }
+
+    const target = representatives.get(
+      find(cell.code),
+    )
+
+    if (!target || target.code === cell.code) {
+      return cell
+    }
+
+    return {
+      ...cell,
+      hex: target.hex,
+      code: target.code,
+      name: target.name,
+      deltaE: colorDifference(
+        cell.averageHex,
+        target.hex,
+      ),
+    }
+  })
+}
+
+/**
+ * 将普通颜色限制到指定数量。
+ * 统一描边色也计入总颜色数。
+ */
+function limitColorCount(
+  cells: QuantizedPixel[],
+  requestedMaxColors: number,
+) {
+  const hasOutline = cells.some(
+    (cell) => cell.isOutline,
+  )
+
+  const normalLimit = Math.max(
+    1,
+    requestedMaxColors -
+      (hasOutline ? 1 : 0),
+  )
+
+  const counts = normalColorCounts(cells)
+
+  if (counts.size <= normalLimit) {
+    return cells
+  }
+
+  const keptCodes = [...counts.entries()]
+    .sort(
+      (left, right) =>
+        right[1] - left[1] ||
+        left[0].localeCompare(right[0]),
+    )
+    .slice(0, normalLimit)
+    .map(([code]) => code)
+
+  const keptSet = new Set(keptCodes)
+
+  const representatives = new Map<
+    string,
+    QuantizedPixel
+  >()
+
+  for (const cell of cells) {
+    if (
+      !cell.isEmpty &&
+      !cell.isOutline &&
+      keptSet.has(cell.code) &&
+      !representatives.has(cell.code)
+    ) {
+      representatives.set(cell.code, cell)
+    }
+  }
+
+  return cells.map((cell) => {
+    if (
+      cell.isEmpty ||
+      cell.isOutline ||
+      keptSet.has(cell.code)
+    ) {
+      return cell
+    }
+
+    let closest:
+      | QuantizedPixel
+      | undefined
+
+    let closestDelta =
+      Number.POSITIVE_INFINITY
+
+    for (
+      const candidate of representatives.values()
+    ) {
+      const delta = colorDifference(
+        cell.hex,
+        candidate.hex,
+      )
+
+      if (delta < closestDelta) {
+        closest = candidate
+        closestDelta = delta
+      }
+    }
+
+    if (!closest) {
+      return cell
+    }
+
+    return {
+      ...cell,
+      hex: closest.hex,
+      code: closest.code,
+      name: closest.name,
+      deltaE: colorDifference(
+        cell.averageHex,
+        closest.hex,
+      ),
+    }
+  })
+}
+
+function createStatistics(
+  cells: QuantizedPixel[],
+) {
+  const stats = new Map<
+    string,
+    PatternColorStat
+  >()
+
+  for (const cell of cells) {
+    if (cell.isEmpty) {
+      continue
+    }
+
+    const existing = stats.get(cell.code)
+
+    if (existing) {
+      existing.count += 1
+    } else {
+      stats.set(cell.code, {
+        code: cell.code,
+        name: cell.isOutline
+          ? OUTLINE_COLOR.name
+          : cell.name,
+        hex: cell.hex,
+        count: 1,
+      })
+    }
+  }
+
+  return [...stats.values()].sort(
+    (left, right) =>
+      right.count - left.count ||
+      left.code.localeCompare(right.code),
+  )
 }
 
 export async function pixelateImage(
   source: string,
   size: number,
+  // 第三个参数与 App.tsx 的调用保持一致；省略时使用安全默认值。
   options: PixelateOptions = {},
 ): Promise<PixelPattern> {
-  if (!Number.isInteger(size) || size < 1) {
+  if (
+    !Number.isInteger(size) ||
+    size < 1
+  ) {
     throw new Error('INVALID_GRID_SIZE')
   }
+
+  const mergeThreshold = Math.max(
+    0,
+    Math.min(
+      30,
+      options.mergeThreshold ??
+        DEFAULT_MERGE_THRESHOLD,
+    ),
+  )
+
+  const maxColors = Math.max(
+    1,
+    Math.min(
+      221,
+      Math.round(
+        options.maxColors ??
+          DEFAULT_MAX_COLORS,
+      ),
+    ),
+  )
 
   const image = await loadImage(source)
 
@@ -384,7 +849,6 @@ export async function pixelateImage(
   }
 
   context.fillStyle = '#FFF9F2'
-
   context.fillRect(
     0,
     0,
@@ -416,11 +880,7 @@ export async function pixelateImage(
     throw new Error('PIXEL_READ_FAILED')
   }
 
-  /**
-   * 每个网格储存三个浮点数：
-   * R、G、B。
-   */
-  const averageColors =
+  const dominantColors =
     new Float64Array(size * size * 3)
 
   for (
@@ -435,7 +895,8 @@ export async function pixelateImage(
     const endY = Math.max(
       startY + 1,
       Math.floor(
-        ((gridY + 1) * sampleSize) / size,
+        ((gridY + 1) * sampleSize) /
+          size,
       ),
     )
 
@@ -456,89 +917,48 @@ export async function pixelateImage(
         ),
       )
 
-      let red = 0
-      let green = 0
-      let blue = 0
-      let count = 0
+      const dominant = dominantCellColor(
+        pixels,
+        sampleSize,
+        startX,
+        endX,
+        startY,
+        endY,
+      )
 
-      for (
-        let y = startY;
-        y < endY;
-        y += 1
-      ) {
-        for (
-          let x = startX;
-          x < endX;
-          x += 1
-        ) {
-          const offset =
-            (y * sampleSize + x) * 4
-
-          red += pixels.data[offset]
-          green += pixels.data[offset + 1]
-          blue += pixels.data[offset + 2]
-          count += 1
-        }
-      }
-
-      const cellOffset =
+      const offset =
         (gridY * size + gridX) * 3
 
-      averageColors[cellOffset] =
-        red / count
+      dominantColors[offset] =
+        dominant.red
 
-      averageColors[cellOffset + 1] =
-        green / count
+      dominantColors[offset + 1] =
+        dominant.green
 
-      averageColors[cellOffset + 2] =
-        blue / count
+      dominantColors[offset + 2] =
+        dominant.blue
     }
   }
 
-  /**
-   * workingColors 会被 Floyd–Steinberg
-   * 误差扩散修改。
-   */
   const workingColors =
-    new Float64Array(averageColors)
+    new Float64Array(dominantColors)
 
-  /**
-   * 默认值由调用方控制。
-   * UI 中去背景开关应默认开启。
-   */
   const backgroundMask =
     options.removeBackground
       ? createBackgroundMask(
-          averageColors,
+          dominantColors,
           size,
         )
       : new Uint8Array(size * size)
 
-  /**
-   * 描边依赖背景蒙版。
-   * UI 中描边开关应默认开启。
-   */
-  const outlineMask =
-    options.outline
-      ? createOutlineMask(
-          backgroundMask,
-          size,
-        )
-      : new Uint8Array(size * size)
-
-  /**
-   * 轮廓统一匹配到一颗接近深灰黑的豆子。
-   * 最终仍会得到合法的 MARD-xxx 色号。
-   */
-  const outlineColor =
-    matchMardColor('#302F33')
+  const outlineMask = options.outline
+    ? createOutlineMask(
+        backgroundMask,
+        size,
+      )
+    : new Uint8Array(size * size)
 
   const cells: QuantizedPixel[] = []
-
-  const stats = new Map<
-    string,
-    PatternColorStat
-  >()
 
   const spreadError = (
     x: number,
@@ -557,27 +977,24 @@ export async function pixelateImage(
       return
     }
 
-    const targetIndex =
-      y * size + x
+    const index = y * size + x
 
-    // 背景格和轮廓格不接受抖动误差。
     if (
-      backgroundMask[targetIndex] ||
-      outlineMask[targetIndex]
+      backgroundMask[index] ||
+      outlineMask[index]
     ) {
       return
     }
 
-    const targetOffset =
-      targetIndex * 3
+    const offset = index * 3
 
-    workingColors[targetOffset] +=
+    workingColors[offset] +=
       red * weight
 
-    workingColors[targetOffset + 1] +=
+    workingColors[offset + 1] +=
       green * weight
 
-    workingColors[targetOffset + 2] +=
+    workingColors[offset + 2] +=
       blue * weight
   }
 
@@ -591,28 +1008,20 @@ export async function pixelateImage(
       gridX < size;
       gridX += 1
     ) {
-      const cellIndex =
+      const index =
         gridY * size + gridX
 
-      const cellOffset =
-        cellIndex * 3
+      const offset = index * 3
 
-      const averageHex = toHex(
-        averageColors[cellOffset],
-        averageColors[cellOffset + 1],
-        averageColors[cellOffset + 2],
+      const dominantHex = toHex(
+        dominantColors[offset],
+        dominantColors[offset + 1],
+        dominantColors[offset + 2],
       )
 
-      /**
-       * 背景格：
-       * - 留白
-       * - 没有色号
-       * - 不进入统计
-       * - 不计入豆子总数
-       */
-      if (backgroundMask[cellIndex]) {
+      if (backgroundMask[index]) {
         cells.push({
-          averageHex,
+          averageHex: dominantHex,
           hex: '#FFFDF8',
           code: '',
           name: '空白（无豆子）',
@@ -624,103 +1033,55 @@ export async function pixelateImage(
         continue
       }
 
-      /**
-       * 主体最外圈：
-       * - 统一使用深灰色豆子
-       * - 正常计入色号统计
-       */
-      if (outlineMask[cellIndex]) {
-        const match: QuantizedPixel = {
-          ...outlineColor,
-          averageHex,
-          isEmpty: false,
-          isOutline: true,
-        }
-
-        cells.push(match)
-
-        const existing = stats.get(
-          match.code,
-        )
-
-        if (existing) {
-          existing.count += 1
-        } else {
-          stats.set(match.code, {
-            code: match.code,
-            name: '轮廓深灰',
-            hex: match.hex,
-            count: 1,
-          })
-        }
+      if (outlineMask[index]) {
+        cells.push({
+          ...OUTLINE_COLOR,
+          averageHex: dominantHex,
+        })
 
         continue
       }
 
       const inputRed = clampChannel(
-        workingColors[cellOffset],
+        workingColors[offset],
       )
 
       const inputGreen = clampChannel(
-        workingColors[cellOffset + 1],
+        workingColors[offset + 1],
       )
 
       const inputBlue = clampChannel(
-        workingColors[cellOffset + 2],
+        workingColors[offset + 2],
       )
 
-      const matched = matchMardColor(
-        toHex(
-          inputRed,
-          inputGreen,
-          inputBlue,
-        ),
+      const inputHex = toHex(
+        inputRed,
+        inputGreen,
+        inputBlue,
       )
 
-      const match: QuantizedPixel = {
-        ...matched,
-        averageHex,
+      const match =
+        matchMardColor(inputHex)
+
+      cells.push({
+        ...match,
+        averageHex: dominantHex,
         isEmpty: false,
         isOutline: false,
-      }
+      })
 
-      cells.push(match)
-
-      const existing = stats.get(
-        match.code,
-      )
-
-      if (existing) {
-        existing.count += 1
-      } else {
-        stats.set(match.code, {
-          code: match.code,
-          name: match.name,
-          hex: match.hex,
-          count: 1,
-        })
-      }
-
-      /**
-       * Floyd–Steinberg 抖动：
-       *
-       * 右侧：7 / 16
-       * 左下：3 / 16
-       * 下方：5 / 16
-       * 右下：1 / 16
-       */
       if (options.dithering) {
-        const matchedRgb =
+        const matched =
           hexToRgb(match.hex)
 
         const errorRed =
-          inputRed - matchedRgb.red
+          inputRed - matched.red
 
         const errorGreen =
-          inputGreen - matchedRgb.green
+          inputGreen - matched.green
 
         const errorBlue =
-          inputBlue - matchedRgb.blue
+          inputBlue - matched.blue
 
         spreadError(
           gridX + 1,
@@ -761,31 +1122,34 @@ export async function pixelateImage(
     }
   }
 
+  const mergedCells =
+    mergeSimilarNeighborColors(
+      cells,
+      size,
+      mergeThreshold,
+    )
+
+  const limitedCells = limitColorCount(
+    mergedCells,
+    maxColors,
+  )
+
   canvas.width = 1
   canvas.height = 1
 
-  const beadCount = cells.reduce(
+  const beadCount = limitedCells.reduce(
     (total, cell) =>
       total + (cell.isEmpty ? 0 : 1),
     0,
   )
 
-  const emptyCount = cells.reduce(
-    (total, cell) =>
-      total + (cell.isEmpty ? 1 : 0),
-    0,
-  )
+  const emptyCount =
+    limitedCells.length - beadCount
 
   return {
     size,
-    cells,
-    stats: [...stats.values()].sort(
-      (left, right) =>
-        right.count - left.count ||
-        left.code.localeCompare(
-          right.code,
-        ),
-    ),
+    cells: limitedCells,
+    stats: createStatistics(limitedCells),
     beadCount,
     emptyCount,
   }
